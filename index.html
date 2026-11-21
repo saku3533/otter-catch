@@ -39,9 +39,22 @@ canvas{display:block;width:100%;height:auto;border-radius:20px;touch-action:none
 <label for="room">ルームコード（12文字まで）</label>
 <input id="room" placeholder="例：かわうそ" autocomplete="off" spellcheck="false" required>
 <p id="error" role="alert" hidden></p>
-<button>スタート</button>
+<button>ひとりでスタート</button>
+<label for="players">参加人数（自分を含む）</label>
+<input id="players" type="number" min="2" max="8" value="2" required>
+<button type="button" id="host">みんなで遊ぶ・部屋を作る</button>
 </form>
-<small>みんなで同じコードを入れて、通話の合図でスタート。<br>A / D・← / → または画面の左右を長押し</small>
+<small>みんなで遊ぶときは、部屋を作って招待リンクを共有。<br>A / D・← / → または画面の左右を長押し</small>
+</section>
+<section class="card" id="lobby" hidden>
+<h1>待機部屋</h1>
+<p id="lobbyStatus" role="status"></p>
+<div class="actions">
+<input id="invite" aria-label="招待リンク" readonly hidden>
+<button id="inviteCopy" hidden>招待リンクをコピー</button>
+<button id="ready" disabled>準備OK</button>
+<button class="secondary" id="leave">タイトルに戻る</button>
+</div>
 </section>
 <section id="play" hidden aria-label="ゲーム">
 <div class="hud"><div><span>残り時間</span><strong id="time">60</strong></div><div><span>今はこれを取る</span><strong id="target"></strong></div><div><span>スコア</span><strong id="score">0</strong></div></div>
@@ -108,7 +121,7 @@ function tone(freq, length, delay = 0, wave = 'sine') {
   osc.stop(at + length);
 }
 function show(id) {
-  for (const name of ['home','play','result']) $(name).hidden = name !== id;
+  for (const name of ['home','lobby','play','result']) $(name).hidden = name !== id;
 }
 function clearInput() {
   keys.clear();
@@ -246,6 +259,10 @@ $('setup').addEventListener('submit', event => {
     return;
   }
   $('error').hidden = true;
+  unlockAudio();
+  startGame(code, performance.now() + 3000);
+});
+function unlockAudio() {
   try {
     const Audio = window.AudioContext || window.webkitAudioContext;
     if (Audio) {
@@ -253,8 +270,10 @@ $('setup').addEventListener('submit', event => {
       audio.resume().catch(() => {});
     }
   } catch {}
+}
+function startGame(code, starts) {
   clearInput();
-  game = {code, starts:performance.now() + 3000, tick:0, round:-1, x:W/2,
+  game = {code, starts, tick:0, round:-1, x:W/2,
     score:0, items:pattern(code), inputs:[], direction:0, lastDirection:0};
   $('target').textContent = types[0];
   $('notice').textContent = '';
@@ -262,7 +281,7 @@ $('setup').addEventListener('submit', event => {
   $('count').hidden = false;
   show('play');
   requestAnimationFrame(frame);
-});
+}
 window.addEventListener('keydown', event => {
   if (!game || !controls[event.code]) return;
   event.preventDefault();
@@ -314,5 +333,204 @@ $('again').addEventListener('click', () => {
   show('home');
   $('room').focus();
 });
+</script>
+<script>
+'use strict';
+let lobby, peerScript;
+const inviteId = () => new URLSearchParams(location.hash.slice(1)).get('join');
+function loadPeer() {
+  if (!peerScript) peerScript = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js';
+    script.onload = resolve;
+    script.onerror = () => {
+      peerScript = null;
+      script.remove();
+      reject(Error('接続ライブラリを読み込めませんでした。'));
+    };
+    document.head.append(script);
+  });
+  return peerScript;
+}
+function leaveLobby() {
+  const old = lobby;
+  lobby = null;
+  old?.peer?.destroy();
+  if (inviteId()) history.replaceState(null, '', location.pathname + location.search);
+  show('home');
+}
+function status(message) {
+  $('lobbyStatus').textContent = message;
+}
+function showCounts(current, total, connected) {
+  status('入室 ' + connected + ' / ' + total + '　｜　準備OK ' + current + ' / ' + total);
+}
+function failLobby(message) {
+  status(message);
+  $('ready').disabled = true;
+}
+function updateHost(room) {
+  if (lobby !== room || room.started) return;
+  const guests = [...room.guests.values()].filter(g => g.connection.open && g.identified);
+  const readyCount = Number(room.ready) + guests.filter(g => g.ready).length;
+  const state = {type:'state', ready:readyCount, total:room.total, connected:1 + guests.length};
+  for (const guest of guests) guest.connection.send(state);
+  showCounts(state.ready,state.total,state.connected);
+  if (readyCount !== room.total) return;
+  room.started = true;
+  const startAt = Date.now() + 3800;
+  for (const guest of guests) guest.connection.send({type:'start', code:room.code, startAt});
+  startGame(room.code, performance.now() + startAt - Date.now());
+}
+function acceptGuest(room, connection) {
+  if (lobby !== room || room.started || room.guests.size >= room.total - 1) {
+    connection.on('open', () => {
+      connection.send({type:'full'});
+      setTimeout(() => connection.close(), 1200);
+    });
+    return;
+  }
+  const guest = {connection, ready:false, identified:false};
+  room.guests.set(connection.peer, guest);
+  const timeout = setTimeout(() => {
+    if (!guest.identified) connection.close();
+  }, 12000);
+  const remove = () => {
+    clearTimeout(timeout);
+    room.guests.delete(connection.peer);
+    updateHost(room);
+  };
+  connection.on('close', remove);
+  connection.on('error', remove);
+  connection.on('data', msg => {
+    if (lobby !== room || room.started || !msg) return;
+    if (msg.type === 'ping' && Number.isFinite(msg.sent)) {
+      connection.send({type:'pong', sent:msg.sent, at:Date.now()});
+    }
+    if (msg.type === 'hello') {
+      guest.identified = true;
+      clearTimeout(timeout);
+      updateHost(room);
+    }
+    if (msg.type === 'ready' && guest.identified) {
+      guest.ready = msg.value === true;
+      updateHost(room);
+    }
+  });
+}
+function joinHost(room, id) {
+  const connection = room.peer.connect(id, {reliable:true});
+  room.connection = connection;
+  const timeout = setTimeout(() => {
+    if (lobby === room && !room.synced) failLobby('接続できませんでした。招待リンクをもう一度開いてね。');
+  }, 12000);
+  const ping = () => connection.send({type:'ping', sent:Date.now()});
+  connection.on('open', ping);
+  connection.on('close', () => {
+    clearTimeout(timeout);
+    if (lobby === room && !room.started) failLobby('主催者との接続が切れました。');
+  });
+  connection.on('error', () => {
+    if (lobby === room && !room.started) failLobby('主催者との接続に失敗しました。');
+  });
+  connection.on('data', msg => {
+    if (lobby !== room || room.started || !msg) return;
+    if (msg.type === 'full') {
+      clearTimeout(timeout);
+      failLobby('部屋が満員か、ゲームが始まっています。');
+    }
+    if (msg.type === 'pong' && !room.synced && Number.isFinite(msg.at) && Number.isFinite(msg.sent)) {
+      const now = Date.now();
+      const rtt = now - msg.sent;
+      if (rtt < room.rtt) {
+        room.rtt = rtt;
+        room.offset = msg.at - (msg.sent + now) / 2;
+      }
+      if (++room.samples < 5) { ping(); return; }
+      room.synced = true;
+      clearTimeout(timeout);
+      connection.send({type:'hello'});
+      $('ready').disabled = false;
+    }
+    if (msg.type === 'state' && room.synced) showCounts(msg.ready,msg.total,msg.connected);
+    if (msg.type === 'start' && room.synced && typeof msg.code === 'string' && Number.isFinite(msg.startAt)) {
+      room.started = true;
+      startGame(msg.code, performance.now() + msg.startAt - (Date.now() + room.offset));
+    }
+  });
+}
+async function openLobby(options) {
+  const room = {ready:false, started:false, guests:new Map(), rtt:Infinity, samples:0, ...options};
+  lobby = room;
+  $('invite').hidden = true;
+  $('inviteCopy').hidden = true;
+  $('inviteCopy').textContent = '招待リンクをコピー';
+  $('ready').disabled = true;
+  $('ready').textContent = '準備OK';
+  status('接続しています…');
+  show('lobby');
+  try {
+    await loadPeer();
+    if (lobby !== room) return;
+    room.peer = new window.Peer();
+    room.peer.on('error', error => {
+      if (lobby !== room || room.started) return;
+      if (room.host && room.peer.open && error.type === 'peer-unavailable') return;
+      failLobby('接続できませんでした。部屋を作り直すか招待リンクを開き直してね。');
+    });
+    if (room.host) room.peer.on('connection', conn => acceptGuest(room, conn));
+    room.peer.on('open', id => {
+      if (lobby !== room) return;
+      if (!room.host) { joinHost(room,room.id); return; }
+      const url = new URL(location.href);
+      url.hash = new URLSearchParams({join:id}).toString();
+      $('invite').value = url.href;
+      $('invite').hidden = false;
+      $('inviteCopy').hidden = false;
+      $('ready').disabled = false;
+      updateHost(room);
+    });
+  } catch (error) {
+    if (lobby === room) failLobby(error.message);
+  }
+}
+$('host').addEventListener('click', () => {
+  if (!['https:','http:'].includes(location.protocol)) {
+    $('error').textContent = 'みんなで遊ぶには、公開URLからゲームを開いてね。';
+    $('error').hidden = false;
+    return;
+  }
+  const code = $('room').value;
+  if (!code.trim() || [...code].length > 12) {
+    $('error').textContent = 'ルームコードは1〜12文字で入力してね。';
+    $('error').hidden = false;
+    return;
+  }
+  if (!$('players').reportValidity()) return;
+  $('error').hidden = true;
+  unlockAudio();
+  openLobby({host:true, code, total:$('players').valueAsNumber});
+});
+$('inviteCopy').addEventListener('click', async () => {
+  const input = $('invite');
+  input.select();
+  try {
+    await navigator.clipboard.writeText(input.value);
+    $('inviteCopy').textContent = 'コピーしたよ！';
+  } catch {
+    if (document.execCommand('copy')) $('inviteCopy').textContent = 'コピーしたよ！';
+  }
+});
+$('ready').addEventListener('click', () => {
+  if (!lobby || lobby.started) return;
+  unlockAudio();
+  lobby.ready = !lobby.ready;
+  $('ready').textContent = lobby.ready ? '準備OKを取り消す' : '準備OK';
+  if (lobby.host) updateHost(lobby);
+  else if (lobby.connection?.open) lobby.connection.send({type:'ready', value:lobby.ready});
+});
+$('leave').addEventListener('click', leaveLobby);
+$('again').addEventListener('click', leaveLobby);
+if (inviteId()) openLobby({host:false,id:inviteId()});
 </script>
 </html>
