@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#f6f2e8">
+<title>ルール反転キャッチ</title>
+<style>
+*{box-sizing:border-box} [hidden]{display:none!important}
+:root{color-scheme:light;color:#173d37;background:#f6f2e8;font-family:system-ui,sans-serif}
+body{margin:0;min-height:100svh;display:grid;place-items:center;padding:16px;background:radial-gradient(ellipse at top,#e0f2e9,transparent 65%)}
+main{width:min(100%,630px);text-align:center}
+.card{padding:clamp(22px,6vw,48px);border:1px solid #c8ded2;border-radius:30px;background:#fffdf6;box-shadow:0 14px 40px #244b3e15}
+.mascot{font-size:76px;line-height:1.1} h1{font-size:clamp(25px,6vw,43px);margin:12px 0;letter-spacing:-.04em}
+p{line-height:1.65;margin:10px 0 18px}
+form{display:grid;gap:10px;max-width:350px;margin:24px auto 0;text-align:left}
+label{font-weight:750} input,button{font:inherit;border-radius:13px;min-height:46px;padding:10px 14px}
+input{width:100%;border:1px solid #7fa59a;background:white;color:inherit}
+button{cursor:pointer;background:#206451;color:white;border:0;font-weight:750}
+button:hover{background:#154e40} button.secondary{color:#173d37;background:#e3f0e8}
+button:focus-visible,input:focus-visible{outline:3px solid #2c8579;outline-offset:3px}
+small{display:block;margin-top:16px;color:#3e6156} #error{color:#8b2933;margin:0}
+.hud{display:grid;grid-template-columns:1fr 2fr 1fr;gap:5px;align-items:center;border-radius:20px;background:#173d37;color:#fffdf6;padding:8px 4px}
+.hud span{display:block;font-size:13px} .hud strong{display:block;font-size:clamp(19px,5vw,30px);font-variant-numeric:tabular-nums}
+#target{font-size:clamp(25px,6vw,38px);line-height:1.25}
+#notice{min-height:30px;padding:4px;font-weight:800;color:#79420c}
+.field{position:relative;width:min(100%,calc(max(180px,100svh - 205px) * 1.25));margin:auto}
+canvas{display:block;width:100%;height:auto;border-radius:20px;touch-action:none;background:#b7e5db}
+#count{position:absolute;inset:0;display:grid;place-items:center;border-radius:20px;background:#173d3759;color:white;font-size:clamp(48px,13vw,96px);font-weight:900;pointer-events:none}
+#play small{margin-top:8px} #resultScore{font-size:clamp(56px,17vw,96px);display:block;line-height:1.08;color:#206451}
+#resultScore::after{content:' 点';font-size:.32em} #resultRoom{overflow-wrap:anywhere}
+.actions{display:grid;gap:8px;max-width:350px;margin:auto} #copyStatus{min-height:26px;margin:8px 0 0}
+</style>
+<main>
+<section class="card" id="home">
+<div class="mascot" aria-hidden="true">🦦</div>
+<h1>ルール反転キャッチ</h1>
+<p>カワウソを動かして、今のお題をキャッチ！<br>10秒ごとに ⭐ → 💣 → 💎 が切り替わるよ。</p>
+<form id="setup">
+<label for="room">ルームコード（12文字まで）</label>
+<input id="room" placeholder="例：かわうそ" autocomplete="off" spellcheck="false" required>
+<p id="error" role="alert" hidden></p>
+<button>スタート</button>
+</form>
+<small>みんなで同じコードを入れて、通話の合図でスタート。<br>A / D・← / → または画面の左右を長押し</small>
+</section>
+<section id="play" hidden aria-label="ゲーム">
+<div class="hud"><div><span>残り時間</span><strong id="time">60</strong></div><div><span>今はこれを取る</span><strong id="target"></strong></div><div><span>スコア</span><strong id="score">0</strong></div></div>
+<div id="notice" aria-live="polite"></div>
+<div class="field">
+<canvas id="river" width="600" height="480" aria-label="カワウソを操作して落下物をキャッチする川"></canvas>
+<div id="count" hidden></div>
+</div>
+<small>A / D・← / → または川の左右を長押し</small>
+</section>
+<section class="card" id="result" hidden>
+<div class="mascot" aria-hidden="true">🦦</div>
+<h1>ゲーム終了</h1>
+<strong id="resultScore"></strong>
+<p>ルーム <b id="resultRoom"></b></p>
+<div class="actions">
+<button id="copy">結果をコピー</button>
+<input id="manualCopy" aria-label="結果のテキスト" readonly hidden>
+<button class="secondary" id="again">もう一度</button>
+</div>
+<p id="copyStatus" role="status"></p>
+</section>
+</main>
+<script>
+'use strict';
+const settings = {duration:60, round:10, warning:2, interval:0.6, minSpeed:160, maxSpeed:280};
+const types = ['⭐ 星','💣 爆弾','💎 宝石'];
+const $ = id => document.getElementById(id);
+const canvas = $('river');
+const ctx = canvas.getContext('2d');
+const W = 600, H = 480, catcherY = 426, step = 120;
+const keys = new Set();
+const pointers = new Map();
+const controls = {KeyA:-1, ArrowLeft:-1, KeyD:1, ArrowRight:1};
+let audio, game;
+function pattern(code) {
+  let seed = 2166136261;
+  for (const char of code) seed = Math.imul(seed ^ char.codePointAt(0), 16777619);
+  function random() {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let n = Math.imul(seed ^ (seed >>> 15), seed | 1);
+    n ^= n + Math.imul(n ^ (n >>> 7), n | 61);
+    return ((n ^ (n >>> 14)) >>> 0) / 4294967296;
+  }
+  const items = [];
+  for (let i = 1; i * settings.interval < settings.duration; i++) {
+    const at = i * settings.interval;
+    items.push({at, x:26 + random() * (W - 52), kind:Math.floor(random() * 3),
+      speed:settings.minSpeed + (settings.maxSpeed - settings.minSpeed) * at / settings.duration});
+  }
+  return items;
+}
+function tone(freq, length, delay = 0, wave = 'sine') {
+  if (!audio || audio.state !== 'running') return;
+  const at = audio.currentTime + delay;
+  const osc = audio.createOscillator(), gain = audio.createGain();
+  osc.type = wave;
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0.075, at);
+  gain.gain.exponentialRampToValueAtTime(0.001, at + length);
+  osc.connect(gain);
+  gain.connect(audio.destination);
+  osc.start(at);
+  osc.stop(at + length);
+}
+function show(id) {
+  for (const name of ['home','play','result']) $(name).hidden = name !== id;
+}
+function clearInput() {
+  keys.clear();
+  pointers.clear();
+}
+function roundAt(t) {
+  return Math.floor(t / settings.round);
+}
+function simulate(t, direction) {
+  const g = game;
+  g.x = Math.max(35, Math.min(W - 35, g.x + direction * 365 / step));
+  const target = roundAt(t) % types.length;
+  for (const item of g.items) {
+    if (item.at > t) break;
+    if (item.caught) continue;
+    const y = -24 + (t - item.at) * item.speed;
+    if (Math.abs(y - catcherY) > 24 || Math.abs(item.x - g.x) > 41) continue;
+    item.caught = true;
+    const good = item.kind === target;
+    g.score = Math.max(0, g.score + (good ? 1 : -1));
+    g.feedback = {good, until:t + 0.25};
+    tone(good ? 1040 : 125, good ? 0.12 : 0.18, 0, good ? 'sine' : 'triangle');
+  }
+}
+function ellipse(x,y,rx,ry,color) {
+  ctx.beginPath();
+  ctx.ellipse(x,y,rx,ry,0,0,Math.PI*2);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+function draw(t) {
+  const g = game;
+  ctx.fillStyle = '#b7e5db';
+  ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle = '#e2f6ee';
+  ctx.lineWidth = 3;
+  for (let i = 0; i < 26; i++) {
+    const x = (i * 137) % W;
+    const y = (i * 79 + t * 12) % H;
+    ctx.beginPath();
+    ctx.moveTo(x,y);
+    ctx.quadraticCurveTo(x+17,y-8,x+34,y);
+    ctx.stroke();
+  }
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = '35px system-ui, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"';
+  for (const item of g.items) {
+    if (item.at > t) break;
+    const y = -24 + (t - item.at) * item.speed;
+    if (!item.caught && y < H + 24) {
+      ellipse(item.x,y,22,22,'#fffdf6');
+      ctx.fillText(types[item.kind].split(' ')[0],item.x,y+1);
+    }
+  }
+  const active = g.feedback && g.feedback.until > t;
+  if (active && g.feedback.good) ellipse(g.x,catcherY+8,46,39,'#59d980');
+  ellipse(g.x,catcherY+33,52,10,'#64aaa4');
+  ellipse(g.x+23,catcherY+18,25,11,'#85503a');
+  ellipse(g.x,catcherY+19,26,21,'#a86d4e');
+  for (const side of [-1,1]) ellipse(g.x+side*24,catcherY-16,9,9,'#85503a');
+  ellipse(g.x,catcherY-6,29,23,'#a86d4e');
+  ellipse(g.x,catcherY+1,18,12,'#f3d1a6');
+  for (const side of [-1,1]) {
+    ellipse(g.x+side*11,catcherY-9,2.8,3.1,'#31231f');
+    ellipse(g.x+side*23,catcherY+1,5,2.8,'#df997a');
+  }
+  ellipse(g.x,catcherY-1,5.5,3.9,'#31231f');
+  if (active && !g.feedback.good) {
+    ctx.fillStyle = '#d32e5038';
+    ctx.fillRect(0,0,W,H);
+  }
+}
+function frame(now) {
+  const g = game;
+  if (!g) return;
+  const elapsed = (now - g.starts) / 1000;
+  const t = Math.max(0, Math.min(settings.duration, elapsed));
+  const round = roundAt(t);
+  const warning = (round + 1) * settings.round < settings.duration &&
+    t >= (round + 1) * settings.round - settings.warning;
+  if (elapsed < 0) {
+    const count = Math.min(3, Math.ceil(-elapsed));
+    if (g.count !== count) tone(440,0.11);
+    g.count = count;
+    $('count').textContent = count;
+  } else {
+    $('count').hidden = true;
+    if (t < settings.duration && g.round !== round) tone(round === 0 ? 760 : 930,0.16);
+    if (warning && g.warned !== round) {
+      tone(540,0.10);
+      tone(660,0.10,0.14);
+      g.warned = round;
+    }
+    if (t < settings.duration && g.round !== round) $('target').textContent = types[round % types.length];
+    g.round = round;
+    const notice = warning ? '次は ' + types[(round + 1) % types.length] : '';
+    if ($('notice').textContent !== notice) $('notice').textContent = notice;
+    while (g.tick < Math.min(Math.floor(t * step), settings.duration * step - 1)) {
+      const tickTime = g.starts + (++g.tick * 1000 / step);
+      while (g.inputs.length && g.inputs[0].at <= tickTime) g.direction = g.inputs.shift().direction;
+      simulate(g.tick / step, g.direction);
+    }
+  }
+  $('time').textContent = Math.ceil(settings.duration - t);
+  $('score').textContent = g.score;
+  if (t >= settings.duration) {
+    $('resultScore').textContent = g.score;
+    $('resultRoom').textContent = g.code;
+    $('manualCopy').value = 'ルーム ' + g.code + ' ｜ スコア ' + g.score + '点';
+    game = null;
+    clearInput();
+    show('result');
+    $('copy').focus();
+    return;
+  }
+  draw(t);
+  requestAnimationFrame(frame);
+}
+function recordInput() {
+  if (!game) return;
+  const directions = [...keys].map(code => controls[code]).concat([...pointers.values()]);
+  const direction = Number(directions.includes(1)) - Number(directions.includes(-1));
+  if (game.lastDirection !== direction) {
+    game.inputs.push({at:performance.now(), direction});
+    game.lastDirection = direction;
+  }
+}
+$('setup').addEventListener('submit', event => {
+  event.preventDefault();
+  const code = $('room').value;
+  if (!code.trim() || [...code].length > 12) {
+    $('error').textContent = 'ルームコードは1〜12文字で入力してね。';
+    $('error').hidden = false;
+    return;
+  }
+  $('error').hidden = true;
+  try {
+    const Audio = window.AudioContext || window.webkitAudioContext;
+    if (Audio) {
+      audio ??= new Audio();
+      audio.resume().catch(() => {});
+    }
+  } catch {}
+  clearInput();
+  game = {code, starts:performance.now() + 3000, tick:0, round:-1, x:W/2,
+    score:0, items:pattern(code), inputs:[], direction:0, lastDirection:0};
+  $('target').textContent = types[0];
+  $('notice').textContent = '';
+  $('count').textContent = '3';
+  $('count').hidden = false;
+  show('play');
+  requestAnimationFrame(frame);
+});
+window.addEventListener('keydown', event => {
+  if (!game || !controls[event.code]) return;
+  event.preventDefault();
+  keys.add(event.code);
+  recordInput();
+});
+window.addEventListener('keyup', event => {
+  keys.delete(event.code);
+  recordInput();
+});
+window.addEventListener('blur', () => {
+  clearInput();
+  recordInput();
+});
+function setPointer(event) {
+  const bounds = canvas.getBoundingClientRect();
+  pointers.set(event.pointerId, event.clientX < bounds.left + bounds.width / 2 ? -1 : 1);
+  recordInput();
+}
+canvas.addEventListener('pointerdown', event => {
+  if (!game || event.button !== 0) return;
+  event.preventDefault();
+  canvas.setPointerCapture(event.pointerId);
+  setPointer(event);
+});
+canvas.addEventListener('pointermove', event => {
+  if (pointers.has(event.pointerId)) setPointer(event);
+});
+for (const name of ['pointerup','pointercancel','lostpointercapture']) {
+  canvas.addEventListener(name, event => {
+    pointers.delete(event.pointerId);
+    recordInput();
+  });
+}
+$('copy').addEventListener('click', async () => {
+  const input = $('manualCopy');
+  try {
+    await navigator.clipboard.writeText(input.value);
+    $('copyStatus').textContent = 'コピーしたよ！';
+  } catch {
+    input.hidden = false;
+    input.select();
+    $('copyStatus').textContent = document.execCommand('copy') ? 'コピーしたよ！' : '表示した文章を選択してコピーしてね。';
+  }
+});
+$('again').addEventListener('click', () => {
+  $('copyStatus').textContent = '';
+  $('manualCopy').hidden = true;
+  show('home');
+  $('room').focus();
+});
+</script>
+</html>
